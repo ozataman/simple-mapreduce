@@ -1,0 +1,37 @@
+Name:                mapreduce-simple
+Version:             0.1
+License:             BSD3
+License-file:        LICENSE
+Author:              Ozgun Ataman
+Maintainer:          ozataman@gmail.com
+Category:            Data
+Build-type:          Simple
+
+-- Extra-source-files:  
+
+Cabal-version:       >=1.2
+
+
+Library
+  hs-source-dirs: src, test
+  Exposed-modules: 
+    Data.MapReduce
+  
+  Build-depends:
+      base > 4
+    , bytestring
+    , containers
+    , mtl > 2
+    , csv-iteratee
+    , redis
+    , redis-simple
+    , binary
+
+  extensions:
+      NoMonomorphismRestriction
+    , OverloadedStrings
+    , FlexibleContexts
+  
+  -- Modules not exported by this package.
+  -- Other-modules:       
+  

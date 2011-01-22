@@ -1,0 +1,14 @@
+:set -XOverloadedStrings
+:set -XTypeSynonymInstances
+:set -XMultiParamTypeClasses
+:set -XNoMonomorphismRestriction
+:set -XTemplateHaskell
+:set -XDeriveDataTypeable
+:set -XFlexibleContexts
+:set -XFlexibleInstances
+:set -Wall
+:set -isrc
+:set -itest
+:set -hide-package monads-tf
+:set -hide-package monads-fd
+
