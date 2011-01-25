@@ -21,6 +21,7 @@ Library
       base > 4
     , bytestring
     , containers
+    , deepseq
     , mtl > 2
     , csv-iteratee
     , redis

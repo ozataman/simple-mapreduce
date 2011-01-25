@@ -6,10 +6,12 @@
 module Data.MapReduce where
 
 import Prelude hiding (catch)
+import Control.DeepSeq
 import Control.Monad
 import Control.Applicative
 import Control.Exception
 import Control.Monad.Reader
+import Control.Concurrent (threadDelay)
 
 import System.Environment
 import System.IO
@@ -56,7 +58,8 @@ data (Binary k1, Binary k2, Binary v1, Binary v2) =>
 -- Feed and Mapping
 ------------------------------------------------------------------------------
 
-feedCSV :: (Binary k1, Binary k2, Binary v1, Binary v2)
+feedCSV :: (Binary k1, Binary k2, Binary v1, Binary v2,
+            NFData v1, NFData k1)
         => FilePath 
         -> CSVSettings 
         -> MRSettings MapRow k1 v1 k2 v2 
@@ -101,6 +104,27 @@ outputCSV conn fo f = loop Nothing
 -- Reducing
 ------------------------------------------------------------------------------
 
+-- Non-terminating ongoing compaction of mapped values
+mrCompactMappedAll s = do
+  r <- runReaderT mrCompactMappedOne s
+  case r of
+    False -> do
+      putStrLn "No keys left, sleeping for a while"
+      threadDelay (5 * 1000 * 1000)
+      mrCompactMappedAll s
+    True -> mrCompactMappedAll s
+
+-- Compact one mapped value in the mapped queue.
+mrCompactMappedOne = do
+  r <- asks mrRedis
+  k <- liftIO $ do
+    select r infoDB
+    lpop r compaction_queue
+  case k of
+    RBulk Nothing -> return False
+    RBulk (Just k') -> reduceM k' >> return True
+
+
 mrReduceAll s = do
   r <- runReaderT mrReduceOne s
   case r of
@@ -117,8 +141,9 @@ mrReduceAndFinalizeAll s = do
 
 mrReduceOne = do
   r <- asks mrRedis
-  liftIO $ select r mapDB 
-  k <- liftIO $ randomKey r
+  k <- liftIO $ do
+    select r mapDB 
+    randomKey r
   case k of
     RBulk Nothing -> return False
     RBulk (Just k') -> reduceM k' >> return True
@@ -137,8 +162,9 @@ mrReduceAndFinalizeOne = do
 mrMap s r = runReaderT f s
   where
     f = do
-      (k,vs) <- asks mrMapper <*> return r
-      pushM k vs
+      mapfun <- asks mrMapper
+      let (k, vs) = mapfun r
+      k `deepseq` vs `deepseq` pushM k vs
 
 
 pushM ::
@@ -154,6 +180,8 @@ pushM k vs = mapM_ push' vs
       liftIO $ do
         select r mapDB
         rpush r (encode k) (encode v)
+        select r infoDB
+        rpush r compaction_queue (encode k)
 
 reduceM k = do
   r <- asks mrRedis
@@ -161,7 +189,7 @@ reduceM k = do
   liftIO $ do
     lock r k
     select r lockDB 
-    vals <- collectList r k
+    vals <- popList r k
     let newval = foldr1 (f (decode k)) vals
     delLock r k
     pushMapped r k newval
@@ -183,6 +211,10 @@ finalizeM k = do
 mapDB = 1
 lockDB = 2
 finDB = 3
+infoDB = 4
+
+compaction_queue :: ByteString
+compaction_queue = "mapped-compact-pending"
 
 
 ------------------------------------------------------------------------------
