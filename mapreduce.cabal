@@ -1,5 +1,5 @@
 Name:                mapreduce-simple
-Version:             0.1
+Version:             0.1.1
 License:             BSD3
 License-file:        LICENSE
 Author:              Ozgun Ataman
@@ -27,6 +27,7 @@ Library
     , redis
     , redis-simple
     , binary
+    , zlib
 
   extensions:
       NoMonomorphismRestriction
