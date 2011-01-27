@@ -67,6 +67,7 @@ feedCSV :: (Binary k1, Binary k2, Binary v1, Binary v2,
         -> IO (Either SomeException Int)
 feedCSV fi csvs mrs = foldCSVFile fi csvs (feedAct mrs) 0
 
+
 feedAct s = funToIterIO feed
   where
     feed i (ParsedRow (Just x)) = do
@@ -78,6 +79,7 @@ feedAct s = funToIterIO feed
               putStrLn $ "Error in mapping on row " ++ show i ++ ": " ++ err
               return $ i + 1)
     feed i _ = return i
+
 
 outputCSV :: (Binary k, Binary v) 
           => Redis -> FilePath -> (k -> v -> MapRow) -> IO ()
@@ -111,17 +113,17 @@ mrCompactMappedAll s = do
   r <- runReaderT mrCompactMappedOne s
   case r of
     False -> do
-      putStrLn "No keys left, sleeping for a while"
+      putStrLn "No keys in mapDB, sleeping for a while"
       threadDelay (5 * 1000 * 1000)
       mrCompactMappedAll s
     True -> mrCompactMappedAll s
 
--- Compact one mapped value in the mapped queue.
+-- Compact one mapped value randomly.
 mrCompactMappedOne = do
   r <- asks mrRedis
   k <- liftIO $ do
-    select r infoDB
-    lpop r compaction_queue
+    select r mapDB
+    randomKey r
   case k of
     RBulk Nothing -> return False
     RBulk (Just k') -> reduceM k' >> return True
@@ -182,8 +184,6 @@ pushM k vs = mapM_ push' vs
       liftIO $ do
         select r mapDB
         rpush r (encode k) (enc v)
-        select r infoDB
-        rpush r compaction_queue (encode k)
 
 -- Reduce, push back into mapDB
 reduceM k = do
@@ -229,10 +229,6 @@ mapDB = 1
 lockDB = 2
 finDB = 3
 infoDB = 4
-
-compaction_queue :: ByteString
-compaction_queue = "mapped-compact-pending"
-
 
 ------------------------------------------------------------------------------
 -- MapReduce related redis ops
