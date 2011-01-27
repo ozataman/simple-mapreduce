@@ -22,6 +22,9 @@ import Data.Maybe
 import Data.ByteString.Char8 (ByteString)
 import qualified Data.ByteString.Char8 as B
 import qualified Data.ByteString.Lazy.Char8 as LB
+import Data.Enumerator (($$))
+import qualified Data.Enumerator as E
+import qualified Data.Enumerator.Binary as E
 
 import Data.Monoid
 import qualified Data.Map as Map
@@ -58,6 +61,14 @@ data (Binary k1, Binary k2, Binary v1, Binary v2) =>
 ------------------------------------------------------------------------------
 -- Feed and Mapping
 ------------------------------------------------------------------------------
+
+
+feedCSVStream h csvs mrs = do
+  hSetBinaryMode h True
+  E.run iter
+  where 
+    iter = E.enumHandle 4096 h $$ iterCSV csvs (feedAct mrs) 0
+
 
 feedCSV :: (Binary k1, Binary k2, Binary v1, Binary v2,
             NFData v1, NFData k1)

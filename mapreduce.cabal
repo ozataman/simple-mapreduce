@@ -22,6 +22,7 @@ Library
     , bytestring
     , containers
     , deepseq
+    , enumerator >= 0.4.5
     , mtl > 2
     , csv-iteratee
     , redis
