@@ -1,5 +1,5 @@
 Name:                mapreduce-simple
-Version:             0.1.1
+Version:             0.2.0
 License:             BSD3
 License-file:        LICENSE
 Author:              Ozgun Ataman
@@ -24,7 +24,7 @@ Library
     , deepseq
     , enumerator >= 0.4.5
     , mtl > 2
-    , csv-iteratee
+    , csv-enumerator
     , redis
     , redis-simple
     , binary

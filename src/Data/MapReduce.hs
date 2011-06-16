@@ -2,6 +2,7 @@
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
 {-# LANGUAGE MultiParamTypeClasses #-}
 {-# LANGUAGE RankNTypes #-}
+{-# LANGUAGE ScopedTypeVariables #-}
 
 module Data.MapReduce where
 
@@ -36,18 +37,18 @@ import Database.Redis.Redis
 import Database.Redis.Simple
 import Database.Redis.ByteStringClass
 
-import Data.CSV.Iteratee
+import Data.CSV.Enumerator
 
 ------------------------------------------------------------------------------
 
 newtype JobKey = JobKey { unJobKey :: ByteString }
   deriving (Show, Eq, Ord, IsString, Monoid, Binary)
 
-type Mapper r k1 v1 = r -> (k1, [v1])
+type Mapper r k1 v1 = r -> IO (k1, [v1], Double)
 
-type Reducer k1 v1 = k1 -> v1 -> v1 -> v1
+type Reducer k1 v1 = k1 -> v1 -> v1 -> IO v1
 
-type Finalizer k1 v1 k2 v2 = k1 -> v1 -> (k2, v2)
+type Finalizer k1 v1 k2 v2 = k1 -> v1 -> IO (k2, v2)
 
 data (Binary k1, Binary k2, Binary v1, Binary v2) => 
   MRSettings r k1 v1 k2 v2 = MRSettings 
@@ -57,6 +58,10 @@ data (Binary k1, Binary k2, Binary v1, Binary v2) =>
     , mrReducer :: Reducer k1 v1
     , mrFinalizer :: Finalizer k1 v1 k2 v2
     }
+
+
+newtype Key = Key (forall a. Binary a => a)
+
 
 ------------------------------------------------------------------------------
 -- Feed and Mapping
@@ -70,6 +75,7 @@ feedCSVStream h csvs mrs = do
     iter = E.enumHandle 4096 h $$ iterCSV csvs (feedAct mrs) 0
 
 
+
 feedCSV :: (Binary k1, Binary k2, Binary v1, Binary v2,
             NFData v1, NFData k1)
         => FilePath 
@@ -79,6 +85,10 @@ feedCSV :: (Binary k1, Binary k2, Binary v1, Binary v2,
 feedCSV fi csvs mrs = foldCSVFile fi csvs (feedAct mrs) 0
 
 
+feedAct ::
+  (CSVeable r, Binary k1, Binary v2, Binary v1, Binary k2,
+   NFData k1, NFData v1, Num a) =>
+  MRSettings r k1 v1 k2 v2 -> CSVAction r a
 feedAct s = funToIterIO feed
   where
     feed i (ParsedRow (Just x)) = do
@@ -91,6 +101,38 @@ feedAct s = funToIterIO feed
               return $ i + 1)
     feed i _ = return i
 
+
+mrMap s r = runReaderT f s
+  where
+    f = do
+      mapfun <- asks mrMapper
+      (k, vs, score) <- liftIO $ mapfun r
+      k `deepseq` vs `deepseq` pushM k vs score
+
+
+pushM ::
+  (Binary v2, Binary v1, Binary k2, Binary k1,
+   MonadReader (MRSettings r k1 v1 k2 v2) m,
+   MonadIO m) =>
+  k1 -> [v1] -> Double -> m ()
+pushM k vs score = mapM_ push' vs >> updateScore k score >> return ()
+  where
+    push' v = do
+      r <- asks mrRedis
+      liftIO $ do
+        select r mapDB
+        rpush r (encode k) (enc v)
+
+
+updateScore k score = do
+  r <- asks mrRedis
+  liftIO $ do
+    select r infoDB
+    zadd r scoresBuffer score (encode k)
+
+------------------------------------------------------------------------------
+-- Outputting 
+------------------------------------------------------------------------------
 
 outputCSV :: (Binary k, Binary v) 
           => Redis -> FilePath -> (k -> v -> MapRow) -> IO ()
@@ -115,9 +157,58 @@ outputCSV conn fo f = loop Nothing
         otherwise -> loop h
   
 
+-- | Keep running and waiting for keys to appear in output
+outputCSVCont 
+  :: (Binary k, Binary v) 
+  => Redis -> FilePath -> (k -> v -> MapRow) -> IO ()
+outputCSVCont conn fo f = bracket acquire hClose loop
+  where
+    wait = do
+      putStrLn "No keys in output, sleeping."
+      threadDelay (10 * 1000 * 1000)
+    acquire = do
+      v <- popRandomFinal conn
+      case v of
+        Nothing -> wait >> acquire
+        Just (k, Just v') -> do
+          h' <- openFile fo WriteMode
+          writeHeaders defCSVSettings h' ([f k v'])
+          return h'
+    loop h = do
+      v <- popRandomFinal conn
+      case v of
+        Nothing -> wait >> loop h
+        Just (k, Just v') -> do
+          let r = (f k v')
+          outputRow defCSVSettings h r >> loop h
+        _ -> loop h
+  
+
 ------------------------------------------------------------------------------
 -- Reducing
 ------------------------------------------------------------------------------
+
+
+mrFinalizeFinishedCont interval = do
+  res <- mrFinalizeFinishedOne interval
+  case res of
+    False -> do
+      liftIO $ do
+        putStrLn "No finished keys, sleeping for a while."
+        threadDelay (1000 * 1000 * 20)
+      mrFinalizeFinishedCont interval
+    True -> mrFinalizeFinishedCont interval
+
+
+mrFinalizeFinishedOne interval = do
+  r <- asks mrRedis
+  k <- liftIO $ do
+    select r infoDB
+    atomicSortedListPop r scoresBuffer interval
+  case k of
+    Just k' -> reduceM k' >> finalizeM k'
+    Nothing -> return False
+
 
 -- Non-terminating ongoing compaction of mapped values
 mrCompactMappedAll s = do
@@ -128,6 +219,7 @@ mrCompactMappedAll s = do
       threadDelay (5 * 1000 * 1000)
       mrCompactMappedAll s
     True -> mrCompactMappedAll s
+
 
 -- Compact one mapped value randomly.
 mrCompactMappedOne = do
@@ -147,12 +239,14 @@ mrReduceAll s = do
       putStrLn "All keys reduced"
     True -> mrReduceAll s
 
+
 mrReduceAndFinalizeAll s = do
   r <- runReaderT mrReduceAndFinalizeOne s
   case r of
     False -> do
       putStrLn "All keys reduced and finalized"
     True -> mrReduceAndFinalizeAll s
+
 
 mrReduceOne = do
   r <- asks mrRedis
@@ -172,31 +266,8 @@ mrReduceAndFinalizeOne = do
     RBulk Nothing -> return False
     RBulk (Just k') -> reduceM k' >> finalizeM k' >> return True
 
-------------------------------------------------------------------------------
 
-mrMap s r = runReaderT f s
-  where
-    f = do
-      mapfun <- asks mrMapper
-      let (k, vs) = mapfun r
-      k `deepseq` vs `deepseq` pushM k vs
-
-
-pushM ::
-  (Binary v2, Binary v1, Binary k2, Binary k1,
-   MonadReader (MRSettings r k1 v1 k2 v2) m,
-   MonadIO m) =>
-  k1 -> [v1] -> m ()
-pushM k vs = mapM_ push' vs
-  where
-    push' v = do
-      r <- asks mrRedis
-      j <- asks mrJobKey
-      liftIO $ do
-        select r mapDB
-        rpush r (encode k) (enc v)
-
--- Reduce, push back into mapDB
+-- | Reduce, push back into mapDB
 reduceM k = do
   r <- asks mrRedis
   f <- asks mrReducer
@@ -211,7 +282,8 @@ reduceM k = do
         case vals of
           [] -> return (RInt 0)
           otherwise -> do
-            let newval = foldr1 (f (decode k)) vals
+            let (v:vs) = reverse vals
+            newval <- foldM (f (decode k)) v vs 
             pushMapped r k newval
         
 
@@ -229,23 +301,27 @@ finalizeM k = do
         case vals of
           [] -> return False
           otherwise -> do
-            let newval = foldr1 (f (decode k)) vals
-            let (finkey, finval) = g (decode k) newval
+            let (v:vs) = reverse vals
+            newval <- foldM (f (decode k)) v vs 
+            (finkey, finval) <- g (decode k) newval
             select r finDB 
             set r (encode finkey) (enc finval)
             return True
 
 
+------------------------------------------------------------------------------
+    
 mapDB = 1
 lockDB = 2
 finDB = 3
 infoDB = 4
+scoresBuffer = "bucketScores" :: ByteString
 
 ------------------------------------------------------------------------------
 -- MapReduce related redis ops
 ------------------------------------------------------------------------------
 
--- Pop a random element from the finDB
+-- | Pop a random element from the finDB
 popRandomFinal ::
   (Binary k, Binary v) =>
   Redis -> IO (Maybe (k, Maybe v))
@@ -258,7 +334,8 @@ popRandomFinal conn = do
       kv <- popFinal conn k'
       return $ Just kv
 
--- Pop an element from the finDB
+
+-- | Pop an element from the finDB
 popFinal conn k = do
   select conn finDB
   v <- get conn k
@@ -267,20 +344,27 @@ popFinal conn k = do
     RBulk Nothing -> (decode k, Nothing)
     RBulk (Just v') -> (decode k, Just $ dec v')
 
--- Lock data in the mapdb by moving to lockdb
+
+-- | Del lock in the lockdb
+delLock :: Redis -> LB.ByteString -> IO (Reply Int)
 delLock conn k = do
   select conn lockDB
   del conn k
 
--- Del lock in the lockdb
+
+-- | Lock data in the mapdb by moving to lockdb
+lock :: Redis -> LB.ByteString -> IO (Reply Int)
 lock conn k = do
   select conn mapDB 
   move conn k lockDB 
 
--- Push a value into the mapped db
+
+-- | Push a value into the mapped db
+pushMapped :: (Binary v) => Redis -> LB.ByteString -> v -> IO (Reply Int)
 pushMapped conn k v = do
   select conn mapDB 
   rpush conn k (enc v)
+
 
 -- Del value from the mapdb
 delMapped conn k = do
@@ -288,8 +372,19 @@ delMapped conn k = do
   del conn k
 
 ------------------------------------------------------------------------------
--- Higher level Redis primitives
+-- Some useful, generic Redis operations
 ------------------------------------------------------------------------------
+
+
+-- | Pop a single element with a socre in the given interval
+atomicSortedListPop 
+  :: Redis -> ByteString -> Interval Double -> IO (Maybe LB.ByteString)
+atomicSortedListPop r k interval = do
+  rep <- fromRMultiBulk' =<< zrangebyscore r k interval (Just (0, 1)) False 
+  case rep of
+    ((a :: LB.ByteString):_) -> zrem r k a >> return (Just a)
+    _ -> return Nothing
+
 
 -- Collect redis list into Haskell list; popping elements one at a time.
 -- Does not delete the key.
