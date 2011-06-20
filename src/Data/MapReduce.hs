@@ -3,6 +3,7 @@
 {-# LANGUAGE MultiParamTypeClasses #-}
 {-# LANGUAGE RankNTypes #-}
 {-# LANGUAGE ScopedTypeVariables #-}
+{-# LANGUAGE BangPatterns #-}
 
 module Data.MapReduce where
 
@@ -13,7 +14,7 @@ import Control.Applicative
 import Control.Exception
 import Control.Monad.Reader
 import Control.Concurrent (threadDelay)
-import Codec.Compression.GZip
+import Codec.Compression.Snappy.Lazy
 
 import System.Environment
 import System.IO
@@ -91,7 +92,7 @@ feedAct ::
   MRSettings r k1 v1 k2 v2 -> CSVAction r a
 feedAct s = funToIterIO feed
   where
-    feed i (ParsedRow (Just x)) = do
+    feed !i (ParsedRow (Just x)) = do
       catch (do 
               mrMap s x
               return $ i + 1)
@@ -99,7 +100,7 @@ feedAct s = funToIterIO feed
               let err = show (e :: ErrorCall)
               putStrLn $ "Error in mapping on row " ++ show i ++ ": " ++ err
               return $ i + 1)
-    feed i _ = return i
+    feed !i _ = return i
 
 
 mrMap s r = runReaderT f s
@@ -177,7 +178,7 @@ outputCSVCont conn fo f = bracket acquire hClose loop
     loop h = do
       v <- popRandomFinal conn
       case v of
-        Nothing -> wait >> loop h
+        Nothing -> hFlush h >> wait >> loop h
         Just (k, Just v') -> do
           let r = (f k v')
           outputRow defCSVSettings h r >> loop h
@@ -204,7 +205,7 @@ mrFinalizeFinishedOne interval = do
   r <- asks mrRedis
   k <- liftIO $ do
     select r infoDB
-    atomicSortedListPop r scoresBuffer interval
+    atomicSortedSetPop r scoresBuffer interval
   case k of
     Just k' -> reduceM k' >> finalizeM k'
     Nothing -> return False
@@ -377,12 +378,15 @@ delMapped conn k = do
 
 
 -- | Pop a single element with a socre in the given interval
-atomicSortedListPop 
-  :: Redis -> ByteString -> Interval Double -> IO (Maybe LB.ByteString)
-atomicSortedListPop r k interval = do
+atomicSortedSetPop 
+  :: Redis 
+  -> ByteString                 -- set buffer's name
+  -> Interval Double            -- score interval to be popped
+  -> IO (Maybe LB.ByteString)
+atomicSortedSetPop r k interval = do
   rep <- fromRMultiBulk' =<< zrangebyscore r k interval (Just (0, 1)) False 
   case rep of
-    ((a :: LB.ByteString):_) -> zrem r k a >> return (Just a)
+    ((a :: LB.ByteString):_) -> a `seq` zrem r k a >> return (Just a)
     _ -> return Nothing
 
 
@@ -408,6 +412,7 @@ collectList conn k = do
     colStep acc (RBulk Nothing) = acc
     colStep acc (RBulk (Just x)) = dec x : acc
 
+-- Compression stuff
 
 enc = compress . encode
 

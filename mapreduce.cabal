@@ -1,5 +1,5 @@
 Name:                mapreduce-simple
-Version:             0.2.0
+Version:             0.2.1
 License:             BSD3
 License-file:        LICENSE
 Author:              Ozgun Ataman
@@ -28,7 +28,7 @@ Library
     , redis
     , redis-simple
     , binary
-    , zlib
+    , snappy
 
   extensions:
       NoMonomorphismRestriction
