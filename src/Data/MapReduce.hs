@@ -173,6 +173,7 @@ outputCSVCont conn fo f = bracket acquire hClose loop
         Nothing -> wait >> acquire
         Just (k, Just v') -> do
           h' <- openFile fo WriteMode
+          hSetBuffering h' NoBuffering
           writeHeaders defCSVSettings h' ([f k v'])
           return h'
     loop h = do
